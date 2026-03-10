@@ -130,31 +130,19 @@ impl DataFrame {
                 for arr in ca.downcast_iter() {
                     let vals = arr.values();
 
-                    // Depending on the desired order, we add items to the buffer.
                     // SAFETY:
                     // We get parallel access to the vector by offsetting index access accordingly.
-                    // For C-order, we only operate on every num-col-th element, starting from the
-                    // column index. For Fortran-order we only operate on n contiguous elements,
-                    // offset by n * the column index.
-                    match ordering {
-                        IndexOrder::C => unsafe {
-                            let num_cols = columns.len();
-                            let mut offset =
-                                (ptr as *mut N::Native).add(col_idx + chunk_offset * num_cols);
-                            for v in vals.iter() {
-                                *offset = *v;
-                                offset = offset.add(num_cols);
-                            }
-                        },
-                        IndexOrder::Fortran => unsafe {
-                            let offset_ptr =
-                                (ptr as *mut N::Native).add(col_idx * height + chunk_offset);
-                            // SAFETY:
-                            // this is uninitialized memory, so we must never read from this data
-                            // copy_from_slice does not read
-                            let buf = std::slice::from_raw_parts_mut(offset_ptr, vals.len());
-                            buf.copy_from_slice(vals)
-                        },
+                    // We always fill in Fortran-order (column-major) as it allows fast memcpy
+                    // operations. For C-order requests, we convert at the end using
+                    // as_standard_layout() which is much faster than strided writes.
+                    unsafe {
+                        let offset_ptr =
+                            (ptr as *mut N::Native).add(col_idx * height + chunk_offset);
+                        // SAFETY:
+                        // this is uninitialized memory, so we must never read from this data
+                        // copy_from_slice does not read
+                        let buf = std::slice::from_raw_parts_mut(offset_ptr, vals.len());
+                        buf.copy_from_slice(vals)
                     }
                     chunk_offset += vals.len();
                 }
@@ -168,14 +156,13 @@ impl DataFrame {
         unsafe {
             membuf.set_len(shape.0 * shape.1);
         }
-        // Depending on the desired order, we can either return the array buffer as-is or reverse
-        // the axes.
+        // We always fill in Fortran-order, then convert to C-order if requested.
+        // This is faster because Fortran-order filling uses memcpy, and
+        // as_standard_layout() is much faster than strided writes.
+        let ndarr = Array2::from_shape_vec((shape.1, shape.0), membuf).unwrap();
         match ordering {
-            IndexOrder::C => Ok(Array2::from_shape_vec((shape.0, shape.1), membuf).unwrap()),
-            IndexOrder::Fortran => {
-                let ndarr = Array2::from_shape_vec((shape.1, shape.0), membuf).unwrap();
-                Ok(ndarr.reversed_axes())
-            },
+            IndexOrder::C => Ok(ndarr.reversed_axes().as_standard_layout().into_owned()),
+            IndexOrder::Fortran => Ok(ndarr.reversed_axes()),
         }
     }
 }
