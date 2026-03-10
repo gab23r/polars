@@ -256,7 +256,17 @@ fn try_df_to_numpy_numeric_supertype(
 
     let np_array = match st {
         dt if dt.is_primitive_numeric() => with_match_physical_numpy_polars_type!(dt, |$T| {
-            df.to_ndarray::<$T>(order).ok()?.into_pyarray(py).into_py_any(py).ok()?
+            // Always create Fortran-order array first (fast path using memcpy).
+            // For C-order, use numpy's optimized ascontiguousarray for conversion.
+            let arr = df.to_ndarray::<$T>(IndexOrder::Fortran).ok()?.into_pyarray(py);
+            match order {
+                IndexOrder::Fortran => arr.into_py_any(py).ok()?,
+                IndexOrder::C => {
+                    let numpy = super::utils::get_numpy_module(py).ok()?;
+                    numpy.call_method1(intern!(py, "ascontiguousarray"), (arr,))
+                        .ok()?.into_py_any(py).ok()?
+                }
+            }
         }),
         _ => return None,
     };
